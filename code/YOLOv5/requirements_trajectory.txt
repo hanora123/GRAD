@@ -1,0 +1,21 @@
+# Trajectory Prediction Requirements
+# Usage: pip install -r requirements_trajectory.txt
+
+# Core dependencies
+numpy>=1.18.5
+opencv-python>=4.1.1
+torch>=1.7.0
+torchvision>=0.8.1
+
+# Trajectory prediction specific
+filterpy>=1.4.5  # for Kalman filtering
+scikit-learn>=0.24.2  # for prediction algorithms
+scipy>=1.4.1  # for mathematical functions
+
+# Data handling and visualization
+matplotlib>=3.2.2
+pandas>=1.1.4
+PyYAML>=5.3.1
+
+# Optional utilities
+tqdm>=4.64.0  # for progress bars
