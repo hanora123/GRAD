@@ -1,176 +1,143 @@
-import torch
-import numpy as np
-from .trajectory import TrajectoryPredictor
-from .general import scale_boxes, xyxy2xywh
-from .plots import Annotator, colors
 import cv2
+import numpy as np
+import torch
+from collections import defaultdict, deque
 
 class TrackPredictor:
-    def __init__(self, history_size=30, future_steps=10):
-        self.trajectory_predictor = TrajectoryPredictor(history_size, future_steps)
-        self.frame_count = 0
-        self.next_id = 0
-        self.iou_threshold = 0.3
+    def __init__(self, history_size=30, future_steps=10, real_sizes=None):
+        self.history_size = history_size
+        self.future_steps = future_steps
+        self.real_sizes = real_sizes or {}
+        self.tracks = defaultdict(lambda: deque(maxlen=history_size))
+        self.class_tracks = {}  # Track class for each ID
+        self.colors = {}  # Consistent colors for each ID
         
-    def _assign_ids(self, dets):
-        """Assign tracking IDs to detections using IoU matching.
+    def process_frame(self, detections, img, class_names, tracked_ids=None):
+        """Process detections and draw trajectories
         
         Args:
-            dets (torch.Tensor): Detections tensor [x1, y1, x2, y2, conf, cls]
-            
-        Returns:
-            torch.Tensor: Detections with tracking IDs [x1, y1, x2, y2, conf, cls, obj_id]
+            detections: Tensor of detections [x1, y1, x2, y2, conf, class]
+            img: Image to draw on
+            class_names: Dictionary of class names
+            tracked_ids: Optional array of tracked IDs corresponding to detections
         """
-        if len(dets) == 0:
-            return torch.empty((0, 7), device=dets.device)
-            
-        # Add tracking IDs column - ensure it's the same dtype as dets
-        id_column = torch.zeros((len(dets), 1), device=dets.device, dtype=dets.dtype)
-        dets_with_ids = torch.cat([dets, id_column], dim=1)
+        height, width = img.shape[:2]
         
-        # For first frame, assign new IDs to all detections
-        if self.frame_count == 0:
-            dets_with_ids[:, -1] = torch.arange(len(dets), device=dets.device, dtype=dets.dtype)
-            self.next_id = len(dets)
-            return dets_with_ids
-            
-        # Check if there are any tracks
-        if len(self.trajectory_predictor.tracks) == 0:
-            # No tracks yet, assign new IDs to all detections
-            dets_with_ids[:, -1] = torch.arange(self.next_id, self.next_id + len(dets), 
-                                               device=dets.device, dtype=dets.dtype)
-            self.next_id += len(dets)
-            return dets_with_ids
-        
-        # Calculate IoU between current and previous detections
-        current_boxes = dets[:, :4]
-        
-        # Get previous boxes, ensuring they are in the correct format
-        try:
-            # Convert list to tensor and ensure it's on the same device as dets
-            prev_boxes_list = [list(track['positions'][-1]) for track in self.trajectory_predictor.tracks.values()]
-            prev_boxes = torch.tensor(prev_boxes_list, device=dets.device)
-            
-            # Check if prev_boxes has the right shape
-            if prev_boxes.shape[1] == 2:  # If only center points [x, y]
-                # Convert center points to boxes [x1, y1, x2, y2]
-                # Using a small box size around each center point
-                box_size = 20  # Adjust this value as needed
-                x, y = prev_boxes[:, 0], prev_boxes[:, 1]
-                prev_boxes = torch.stack([
-                    x - box_size/2, y - box_size/2,  # x1, y1
-                    x + box_size/2, y + box_size/2   # x2, y2
-                ], dim=1)
-            
-            if len(prev_boxes) > 0:
-                iou_matrix = box_iou(current_boxes, prev_boxes)
-                matched_indices = torch.nonzero(iou_matrix > self.iou_threshold)
+        # Process each detection
+        for i, (*xyxy, conf, cls_id) in enumerate(detections):
+            # Get object ID - either from tracker or generate a new one
+            if tracked_ids is not None:
+                obj_id = int(tracked_ids[i])
+            else:
+                # This is a fallback if no tracker is used (not recommended)
+                obj_id = i + 1
                 
-                # Assign existing IDs to matched detections
-                for i, j in matched_indices:
-                    track_id = list(self.trajectory_predictor.tracks.keys())[j]
-                    # Convert track_id to the same dtype as dets
-                    dets_with_ids[i, -1] = float(track_id)  # Convert to float if dets is float
-        except Exception as e:
-            # If there's any error in matching, just assign new IDs
-            print(f"Error in tracking: {e}")
-        
-        # Assign new IDs to unmatched detections
-        unmatched_mask = dets_with_ids[:, -1] == 0
-        num_unmatched = int(unmatched_mask.sum().item())
-        
-        # Create new IDs with the same dtype as dets
-        new_ids = torch.arange(self.next_id, self.next_id + num_unmatched, 
-                              device=dets.device, dtype=dets.dtype)
-        
-        # Assign new IDs to unmatched detections
-        if num_unmatched > 0:
-            dets_with_ids[unmatched_mask, -1] = new_ids
-            self.next_id += num_unmatched
-        
-        return dets_with_ids
-        
-    def process_frame(self, dets, img):
-        """Process frame detections and predict trajectories.
-        
-        Args:
-            dets (torch.Tensor): YOLOv5 detections tensor [x1, y1, x2, y2, conf, cls]
-            img (numpy.ndarray): Original image
+            # Get class name
+            cls_id = int(cls_id)
+            cls_name = class_names[cls_id]
             
-        Returns:
-            numpy.ndarray: Annotated image with trajectories
-        """
-        # Assign tracking IDs
-        dets_with_ids = self._assign_ids(dets)
-        
-        # Update trajectory predictor
-        self.trajectory_predictor.update_tracks(dets_with_ids, self.frame_count)
-        
-        # Draw detections and trajectories
-        annotator = Annotator(img.copy())
-        
-        for det in dets_with_ids:
-            xyxy = det[:4].cpu().numpy()
-            conf = det[4].cpu().numpy()
-            cls_id = int(det[5])
-            obj_id = int(det[6])
+            # Store class for this ID
+            self.class_tracks[obj_id] = cls_name
+            
+            # Get bounding box coordinates
+            x1, y1, x2, y2 = [int(coord) for coord in xyxy]
+            
+            # Calculate center point of the bottom of the box (feet position)
+            center_x = (x1 + x2) // 2
+            center_y = y2
+            
+            # Store the position in track history
+            self.tracks[obj_id].append((center_x, center_y))
+            
+            # Assign consistent color for this ID if not already assigned
+            if obj_id not in self.colors:
+                # Generate a color based on ID to ensure consistency
+                self.colors[obj_id] = (
+                    (obj_id * 123) % 255,
+                    (obj_id * 85) % 255,
+                    (obj_id * 47) % 255
+                )
             
             # Draw bounding box
-            label = f'{obj_id} {conf:.2f}'
-            annotator.box_label(xyxy, label, color=colors(cls_id, True))
+            color = self.colors[obj_id]
+            cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
             
-            # Predict and draw trajectory
-            trajectory = self.trajectory_predictor.predict_trajectory(obj_id, self.frame_count)
-            if trajectory is not None:
-                points = trajectory.astype(np.int32)
+            # Draw ID and class
+            label = f"{cls_name} {obj_id}"
+            t_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+            cv2.rectangle(img, (x1, y1), (x1 + t_size[0], y1 - t_size[1] - 3), color, -1)
+            cv2.putText(img, label, (x1, y1 - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            
+            # Draw trajectory (past positions)
+            if len(self.tracks[obj_id]) > 1:
+                points = list(self.tracks[obj_id])
+                for j in range(1, len(points)):
+                    # Draw line with increasing thickness for more recent positions
+                    thickness = int(np.sqrt(float(j) / 5) + 1)
+                    cv2.line(img, points[j-1], points[j], color, thickness)
+            
+            # Predict future trajectory if we have enough history
+            if len(self.tracks[obj_id]) >= 2:
+                future_points = self._predict_trajectory(self.tracks[obj_id], self.future_steps)
                 
-                # Draw historical trajectory (past positions) with a different color
-                if 'positions' in self.trajectory_predictor.tracks.get(obj_id, {}):
-                    past_positions = np.array(self.trajectory_predictor.tracks[obj_id]['positions'])
-                    if len(past_positions) > 1:
-                        past_points = past_positions.astype(np.int32)
-                        for i in range(len(past_points) - 1):
-                            # Draw historical trajectory with a different color (e.g., blue)
-                            cv2.line(annotator.im, 
-                                    (past_points[i][0], past_points[i][1]), 
-                                    (past_points[i+1][0], past_points[i+1][1]), 
-                                    (255, 0, 0),  # Blue for past trajectory
-                                    thickness=2)
-                
-                # Draw predicted future trajectory
-                for i in range(len(points) - 1):
-                    # Draw future trajectory with the class color
-                    cv2.line(annotator.im, 
-                            (points[i][0], points[i][1]), 
-                            (points[i+1][0], points[i+1][1]), 
-                            colors(cls_id, True),  # Use class color for future trajectory
-                            thickness=2)
-                    
-                # Draw dots at each predicted point for better visibility
-                for point in points:
-                    cv2.circle(annotator.im, (point[0], point[1]), 3, colors(cls_id, True), -1)
-                    
-        self.frame_count += 1
-        self.trajectory_predictor.cleanup_old_tracks(self.frame_count)
+                # Draw predicted trajectory
+                last_point = self.tracks[obj_id][-1]
+                for point in future_points:
+                    cv2.line(img, last_point, point, (255, 255, 255), 1, cv2.LINE_AA)
+                    cv2.circle(img, point, 3, color, -1)
+                    last_point = point
         
-        return annotator.result()
+        # Clean up old tracks that haven't been updated
+        current_ids = set([int(tracked_ids[i]) for i in range(len(tracked_ids))] if tracked_ids is not None 
+                          else set(range(1, len(detections) + 1)))
         
-def box_iou(box1, box2):
-    """Calculate IoU between two sets of boxes.
-    
-    Args:
-        box1 (torch.Tensor): First set of boxes (N, 4)
-        box2 (torch.Tensor): Second set of boxes (M, 4)
+        # Remove tracks that haven't been seen in this frame
+        ids_to_remove = []
+        for track_id in self.tracks:
+            if track_id not in current_ids:
+                ids_to_remove.append(track_id)
         
-    Returns:
-        torch.Tensor: IoU matrix (N, M)
-    """
-    area1 = (box1[:, 2] - box1[:, 0]) * (box1[:, 3] - box1[:, 1])
-    area2 = (box2[:, 2] - box2[:, 0]) * (box2[:, 3] - box2[:, 1])
+        # Only remove tracks if they haven't been updated for a while
+        for track_id in ids_to_remove:
+            if len(self.tracks[track_id]) < self.history_size:
+                del self.tracks[track_id]
+                if track_id in self.class_tracks:
+                    del self.class_tracks[track_id]
+                if track_id in self.colors:
+                    del self.colors[track_id]
+        
+        return img
     
-    lt = torch.max(box1[:, None, :2], box2[:, :2])
-    rb = torch.min(box1[:, None, 2:], box2[:, 2:])
-    wh = (rb - lt).clamp(min=0)
-    inter = wh[:, :, 0] * wh[:, :, 1]
-    
-    return inter / (area1[:, None] + area2 - inter)
+    def _predict_trajectory(self, track, steps):
+        """Predict future trajectory based on past positions"""
+        if len(track) < 2:
+            return []
+        
+        # Use the last few points to calculate velocity
+        positions = list(track)
+        if len(positions) >= 5:
+            positions = positions[-5:]  # Use last 5 positions for better prediction
+            
+        # Calculate average velocity vector
+        velocities = []
+        for i in range(1, len(positions)):
+            vx = positions[i][0] - positions[i-1][0]
+            vy = positions[i][1] - positions[i-1][1]
+            velocities.append((vx, vy))
+        
+        # Average velocity
+        avg_vx = sum(v[0] for v in velocities) / len(velocities)
+        avg_vy = sum(v[1] for v in velocities) / len(velocities)
+        
+        # Predict future positions
+        future_points = []
+        last_x, last_y = positions[-1]
+        
+        for i in range(1, steps + 1):
+            # Apply some damping to make predictions more realistic
+            damping = 0.9 ** i
+            next_x = int(last_x + avg_vx * i * damping)
+            next_y = int(last_y + avg_vy * i * damping)
+            future_points.append((next_x, next_y))
+        
+        return future_points

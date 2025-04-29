@@ -2,15 +2,22 @@ import argparse
 import os
 import sys
 from pathlib import Path
+import json
 
 import cv2
 import torch
 import platform  # Add platform import for Linux window handling
+import numpy as np
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
+
+# Add the parent directory to sys.path to access TDNet
+PARENT = ROOT.parent  # Parent directory containing TDNet
+if str(PARENT) not in sys.path:
+    sys.path.append(str(PARENT))
 
 from models.common import DetectMultiBackend
 from utils.dataloaders import IMG_FORMATS, VID_FORMATS, LoadImages, LoadScreenshots, LoadStreams
@@ -20,6 +27,9 @@ from utils.general import (LOGGER, Profile, check_file, check_img_size, check_im
 from utils.plots import Annotator, colors, save_one_box
 from utils.torch_utils import select_device, smart_inference_mode
 from utils.track_predict import TrackPredictor
+
+# Import SORT tracker from TDNet using absolute import
+from TDNet.Trakers import SORT
 
 @smart_inference_mode()
 def run(weights='yolov5s.pt',  # model path
@@ -62,27 +72,100 @@ def run(weights='yolov5s.pt',  # model path
     if is_url and is_file:
         source = check_file(source)  # download
 
-    # Directories
+    # Directories setup - TDNet style
+    root = os.path.dirname(os.path.abspath(source))
+    filename = os.path.basename(source).split('.')[0]
+    path = os.path.join(root, filename)
+    
+    # Create output directories
     if custom_output:
-        # Use custom output directory if provided
-        custom_dir = Path(custom_output)
-        if not custom_dir.exists():
-            custom_dir.mkdir(parents=True, exist_ok=True)
-        save_dir = custom_dir
+        output_base = custom_output
     else:
-        # Use default directory structure
-        save_dir = increment_path(Path(project) / name, exist_ok=exist_ok)  # increment run
-        
-    (save_dir / 'labels' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
-
+        output_base = os.path.join(project, name)
+    
+    video_dir = os.path.join(output_base, 'Video')
+    figure_dir = os.path.join(output_base, 'Figure')
+    
+    # Create directories if they don't exist
+    os.makedirs(path, exist_ok=True)
+    os.makedirs(video_dir, exist_ok=True)
+    os.makedirs(figure_dir, exist_ok=True)
+    
+    LOGGER.info(f': Video Folder Created: {video_dir}')
+    LOGGER.info(f': Figure Folder Created: {figure_dir}')
+    
+    # Create configuration file
+    config = {
+        'General': {
+            'Speed Limitation': 30,
+            'Speed Unit': 'mph',
+            'Real Size (cm)': {
+                'person': (70),
+                'car': (470, 190),
+                'truck': (470, 190),
+                'bus': (1195, 255),
+                'motorcycle': (190, 70),
+                'bicycle': (180, 50)
+            }
+        },
+        'Visualizer': {
+            '1/0': 1,
+            '3D Detection': {'1/0': 1, 'Show': 0, 'Save': 0, 'Rithm': 100, 'Video': 1},
+            'CONFIGS': {
+                'Show Caption': 1,
+                'Show Speed': 0,
+                'Speed Unit Text': ' mph',
+                'Speed Text Color': (0, 0, 0),
+                'vSpeed Text Color': (0, 0, 200),
+                'person': {
+                    '3D': {'color': (250, 30, 30), 'tcolor': (250, 50, 50), 'bcolor': (255, 100, 100), 'size': (8, 8)}
+                },
+                'car': {
+                    '3D': {'color': (0, 150, 0), 'tcolor': (0, 220, 0), 'bcolor': (0, 200, 0), 'height_coef': 0.6, 'direction': False}
+                },
+                'truck': {
+                    '3D': {'color': (0, 150, 0), 'tcolor': (0, 220, 0), 'bcolor': (0, 200, 0), 'height_coef': 0.65, 'direction': False}
+                },
+                'bus': {
+                    '3D': {'color': (30, 90, 160), 'tcolor': (50, 120, 200), 'bcolor': (15, 100, 240), 'height_coef': 0.7, 'direction': True}
+                },
+                'motorcycle': {
+                    '3D': {'color': (160, 160, 34), 'tcolor': (160, 180, 54), 'bcolor': (0, 200, 0), 'height_coef': 0.6, 'direction': False}
+                },
+                'bicycle': {
+                    '3D': {'color': (255, 130, 90), 'tcolor': (255, 150, 20), 'bcolor': (254, 232, 125), 'height_coef': 0.7, 'direction': False}
+                }
+            }
+        },
+        'System': {
+            'Video Format': 'DIVX'  # Same as TDNet
+        }
+    }
+    
+    # Save configuration
+    config_path = os.path.join(path, 'config.json')
+    with open(config_path, 'w') as f:
+        json.dump(config, f, indent=4)
+    
     # Load model
     device = select_device(device)
     model = DetectMultiBackend(weights, device=device, dnn=dnn, data=data, fp16=half)
     stride, names, pt = model.stride, model.names, model.pt
     imgsz = check_img_size(imgsz, s=stride)  # check image size
 
-    # Initialize trajectory predictor
-    track_predictor = TrackPredictor(history_size=history_size, future_steps=future_steps)
+    # Initialize trajectory predictor with real sizes from config
+    track_predictor = TrackPredictor(
+        history_size=history_size, 
+        future_steps=future_steps,
+        real_sizes=config['General']['Real Size (cm)']
+    )
+    
+    # Initialize SORT tracker with parameters from TDNet configuration
+    sort_tracker = SORT(
+        max_age=30,     # Maximum frames to keep object without detection
+        min_hits=3,     # Minimum detection hits to start tracking
+        iou_threshold=0.2  # IOU threshold for matching
+    )
 
     # Dataloader
     bs = 1  # batch_size
@@ -111,7 +194,7 @@ def run(weights='yolov5s.pt',  # model path
 
         # Inference
         with dt[1]:
-            visualize = increment_path(save_dir / Path(path).stem, mkdir=True) if visualize else False
+            visualize = increment_path(Path(output_base) / Path(path).stem, mkdir=True) if visualize else False
             pred = model(im, augment=augment, visualize=visualize)
 
         # NMS
@@ -128,18 +211,35 @@ def run(weights='yolov5s.pt',  # model path
                 p, im0, frame = path, im0s.copy(), getattr(dataset, 'frame', 0)
 
             p = Path(p)  # to Path
-            save_path = str(save_dir / p.name)  # im.jpg
-            txt_path = str(save_dir / 'labels' / p.stem) + ('' if dataset.mode == 'image' else f'_{frame}')
+            save_path = str(Path(video_dir) / p.name)  # im.jpg
+            txt_path = str(Path(output_base) / 'labels' / p.stem) + ('' if dataset.mode == 'image' else f'_{frame}')
             s += '%gx%g ' % im.shape[2:]  # print string
             gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
 
             if len(det):
                 # Rescale boxes from img_size to im0 size
                 det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
-
-                annotator = Annotator(im0, line_width=line_thickness, example=str(names))
-                # Process detections and predict trajectories
-                im0 = track_predictor.process_frame(det, im0)
+                
+                # Convert detections to format expected by SORT
+                # Format: [x1, y1, x2, y2, confidence, class]
+                tracked_dets = sort_tracker.update(det.cpu().numpy())
+                
+                # Process tracked detections and predict trajectories with 3D boxes
+                # Create a new tensor with the same structure as det but with tracked IDs
+                if len(tracked_dets) > 0:
+                    # Convert tracked detections back to tensor format for processing
+                    tracked_tensor = torch.zeros((len(tracked_dets), 6))
+                    for j, trk in enumerate(tracked_dets):
+                        # Format: [x1, y1, x2, y2, ID, class]
+                        tracked_tensor[j, 0:4] = torch.tensor(trk[0:4])  # bbox
+                        tracked_tensor[j, 4] = torch.tensor(det[j, 4])   # confidence
+                        tracked_tensor[j, 5] = torch.tensor(det[j, 5])   # class
+                        
+                    # Process with consistent IDs from tracker
+                    im0 = track_predictor.process_frame(tracked_tensor, im0, names, tracked_ids=tracked_dets[:, 4])
+                else:
+                    # If no tracked detections, process original detections
+                    im0 = track_predictor.process_frame(det, im0, names)
 
                 # Print results
                 for c in det[:, 5].unique():
@@ -147,8 +247,6 @@ def run(weights='yolov5s.pt',  # model path
                     s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
 
             # Stream results
-            # im0 = Annotator(im0, line_width=line_thickness, example=str(names))
-
             if view_img:
                 if platform.system() == 'Linux' and p not in windows:
                     windows.append(p)
@@ -172,25 +270,22 @@ def run(weights='yolov5s.pt',  # model path
                             h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                         else:  # stream
                             fps, w, h = 30, im0.shape[1], im0.shape[0]
-                            
-                        # Create output path
-                        if custom_output:
-                            # Use custom output path with original filename
-                            filename = Path(path).name
-                            save_path = str(Path(custom_output) / filename)
-                        
                         save_path = str(Path(save_path).with_suffix('.mp4'))  # force *.mp4 suffix on results videos
-                        vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
+                        # Use DIVX codec as in TDNet
+                        vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*config['System']['Video Format']), fps, (w, h))
                     vid_writer[i].write(im0)
+
+        # Print time (inference-only)
+        LOGGER.info(f"{s}{'' if len(det) else '(no detections), '}{dt[1].dt * 1E3:.1f}ms")
 
     # Print results
     t = tuple(x.t / seen * 1E3 for x in dt)  # speeds per image
     LOGGER.info(f'Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {(1, 3, *imgsz)}' % t)
     if save_txt or save_img:
-        s = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if save_txt else ''
-        LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}{s}")
+        s = f"\n{len(list(Path(output_base).glob('labels/*.txt')))} labels saved to {Path(output_base) / 'labels'}" if save_txt else ''
+        LOGGER.info(f"Results saved to {colorstr('bold', Path(output_base))}{s}")
     if update:
-        strip_optimizer(weights[0])  # update model (to fix SourceChangeWarning)
+        strip_optimizer(weights)
 
 def parse_opt():
     parser = argparse.ArgumentParser()
@@ -233,50 +328,6 @@ def main(opt):
     check_requirements(exclude=('tensorboard', 'thop'))
     run(**vars(opt))
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     opt = parse_opt()
     main(opt)
-
-
-class TrackPredictor:
-    def process_frame(self, det, im0):
-        # Process detections and predict trajectories
-        trajectory_data = []  # Store trajectory data for each detection
-        
-        if len(det):
-            for *xyxy, conf, cls in det:
-                # Get trajectory prediction
-                x1, y1, x2, y2 = xyxy
-                center_x = (x1 + x2) / 2
-                center_y = (y1 + y2) / 2
-                
-                # Add to trajectory data
-                trajectory_data.append({
-                    'frame_id': self.frame_count,
-                    'class': int(cls),
-                    'confidence': float(conf),
-                    'bbox': [float(x) for x in xyxy],
-                    'center': [float(center_x), float(center_y)]
-                })
-                
-                # Draw on image as before
-                # ... existing trajectory visualization code ...
-        
-        # Save trajectory data to separate file
-        if trajectory_data:
-            self.save_trajectory_data(trajectory_data)
-        
-        return im0
-    
-    def save_trajectory_data(self, trajectory_data):
-        import json
-        import os
-        
-        # Create trajectory directory if it doesn't exist
-        trajectory_dir = os.path.join(self.save_dir, 'trajectories')
-        os.makedirs(trajectory_dir, exist_ok=True)
-        
-        # Save trajectory data for current frame
-        trajectory_file = os.path.join(trajectory_dir, f'frame_{self.frame_count:06d}.json')
-        with open(trajectory_file, 'w') as f:
-            json.dump(trajectory_data, f, indent=2)
