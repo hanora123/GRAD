@@ -210,9 +210,16 @@ class Load:
     
     def Run(self):
         Stream = TN.Utils.Video(self.Input, lenght_of_video = self.EndAt)
-        if self.cfg['Detector']['SORT']['1/0']:  mcmot = TN.Trakers.SORT(self.cfg['Detector']['SORT']['Max Age'], 
-                                                                         self.cfg['Detector']['SORT']['Min His'], 
-                                                                         self.cfg['Detector']['SORT']['IoU the']) 
+        # Calculate total number of frames for tqdm
+        total_frames = 0
+        if hasattr(Stream, 'cap') and Stream.cap is not None:
+            if self.EndAt is None or self.EndAt == 0:
+                total_frames = int(Stream.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            else:
+                # If EndAt is specified, use it as the frame limit
+                total_frames = min(int(Stream.cap.get(cv2.CAP_PROP_FRAME_COUNT)), self.EndAt)
+
+        if self.cfg['Detector']['SORT']['1/0']:  mcmot = TN.Trakers.SORT(self.cfg['Detector']['SORT']['Max Age'], self.cfg['Detector']['SORT']['Min His'], self.cfg['Detector']['SORT']['IoU the']) 
         _vehicle = dict()
         _pedest = dict()
         Videos = dict()
@@ -240,11 +247,11 @@ class Load:
                 if self.cfg['Visualizer']['Environment Map']['Video']: Videos['Env']  = cv2.VideoWriter(self.OutVideo + f'/TDNet - Environment Map - [{str(self.StartFrom)} - {str(self.EndAt)}].avi', cv2.VideoWriter_fourcc(*self.cfg['System']['Video Format']), Stream.fps, self.BevSize)
 
         if self.cfg['Figure']['1/0']:
-            if self.cfg['Figure']['Counter']:
+            if self.cfg['Figure']['Counter']['1/0']:
                 Cache['Counter Figure'] = np.ones((self.cfg['Figure']['Counter']['Size'][1]*100, self.cfg['Figure']['Counter']['Size'][0]*100, 3), dtype=np.uint8) *255
                 if self.cfg['Figure']['Counter']['Video']:
                     Videos['Cont']  = cv2.VideoWriter(self.OutVideo + f'/TDNet - Figure of Counters - [{str(self.StartFrom)} - {str(self.EndAt)}].avi', cv2.VideoWriter_fourcc(*self.cfg['System']['Video Format']), Stream.fps, (self.cfg['Figure']['Counter']['Size'][0]*100, self.cfg['Figure']['Counter']['Size'][1]*100))
-            if self.cfg['Figure']['AVGSpeed']:
+            if self.cfg['Figure']['AVGSpeed']['1/0']:
                 Cache['AVGS Figure'] = np.ones((self.cfg['Figure']['AVGSpeed']['Size'][1]*100, self.cfg['Figure']['AVGSpeed']['Size'][0]*100, 3), dtype=np.uint8) *255
                 if self.cfg['Figure']['AVGSpeed']['Video']: 
                     Videos['AVGS']  = cv2.VideoWriter(self.OutVideo + f'/TDNet - Figure of Average Speed - [{str(self.StartFrom)} - {str(self.EndAt)}].avi', cv2.VideoWriter_fourcc(*self.cfg['System']['Video Format']), Stream.fps, (self.cfg['Figure']['AVGSpeed']['Size'][0]*100, self.cfg['Figure']['AVGSpeed']['Size'][1]*100))
@@ -294,8 +301,10 @@ class Load:
                 if self.cfg['Heatmap']['Crowd']['VideoBEV']: Videos['Crowd_BEV'] = cv2.VideoWriter(self.OutVideo + f'/TDNet - Heatmap Vehicle Crowd BEV - [{str(self.StartFrom)} - {str(self.EndAt)}].avi', cv2.VideoWriter_fourcc(*self.cfg['System']['Video Format']), Stream.fps, self.BevSize)
                 Cache['Vehicle Crowd'] = np.zeros((self.BevSize[1],self.BevSize[0]))
 
-
-        for frame, frame_read in tqdm(iter(Stream), desc='Processing', ncols=100, unit=' Frame'):
+        stream_iterator = iter(Stream)
+        progress_bar = tqdm(total=total_frames, desc='Processing', ncols=100, unit=' Frame')
+        for frame, frame_read in stream_iterator:
+            progress_bar.update(1)
 
             if frame < int(self.StartFrom): continue
             if self.EndAt != -1: 
@@ -536,7 +545,7 @@ class Load:
                     if self.cfg['Visualizer']['3D Detection']['Show']: cv2.imshow('3D Detection', cv2.resize(imgBox3D, (imgBox3D.shape[1] // self.cfg['System']['Show Window Size'][1], imgBox3D.shape[0] // self.cfg['System']['Show Window Size'][0])))
                     if frame % self.cfg['Visualizer']['3D Detection']['Rithm'] == 0: 
                         if self.cfg['Visualizer']['3D Detection']['Save']: cv2.imwrite(self.OutFigure + f'/{frame} 3D.png', imgBox3D)
-
+            progress_bar.update(1)
             k=cv2.waitKey(1)
             if k%256 == 27: cv2.destroyAllWindows(); break
         for v in Videos: Videos[v].release()

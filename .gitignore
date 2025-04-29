@@ -1,0 +1,7 @@
+code/TDNet/__pycache__/
+output/
+code/YOLOv5/utils/segment/__pycache__/
+code/YOLOv5/utils/__pycache__/
+code/YOLOv5/models/__pycache__/
+code/YOLOv5/__pycache__/
+code/YOLOv5/runs/

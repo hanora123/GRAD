@@ -5,6 +5,7 @@ from pathlib import Path
 
 import cv2
 import torch
+import platform  # Add platform import for Linux window handling
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
@@ -14,7 +15,7 @@ if str(ROOT) not in sys.path:
 from models.common import DetectMultiBackend
 from utils.dataloaders import IMG_FORMATS, VID_FORMATS, LoadImages, LoadScreenshots, LoadStreams
 from utils.general import (LOGGER, Profile, check_file, check_img_size, check_imshow, check_requirements,
-                          colorstr, cv2.rectangle, increment_path, non_max_suppression, print_args,
+                          colorstr, increment_path, non_max_suppression, print_args,
                           scale_boxes, strip_optimizer)
 from utils.plots import Annotator, colors, save_one_box
 from utils.torch_utils import select_device, smart_inference_mode
@@ -50,6 +51,7 @@ def run(weights='yolov5s.pt',  # model path
         vid_stride=1,  # video frame-rate stride
         history_size=30,  # number of frames to keep in trajectory history
         future_steps=10,  # number of steps to predict into future
+        custom_output=None,  # custom output path for video
         ):
     source = str(source)
     save_img = not nosave and not source.endswith('.txt')  # save inference images
@@ -61,7 +63,16 @@ def run(weights='yolov5s.pt',  # model path
         source = check_file(source)  # download
 
     # Directories
-    save_dir = increment_path(Path(project) / name, exist_ok=exist_ok)  # increment run
+    if custom_output:
+        # Use custom output directory if provided
+        custom_dir = Path(custom_output)
+        if not custom_dir.exists():
+            custom_dir.mkdir(parents=True, exist_ok=True)
+        save_dir = custom_dir
+    else:
+        # Use default directory structure
+        save_dir = increment_path(Path(project) / name, exist_ok=exist_ok)  # increment run
+        
     (save_dir / 'labels' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
 
     # Load model
@@ -87,6 +98,9 @@ def run(weights='yolov5s.pt',  # model path
     # Run inference
     model.warmup(imgsz=(1 if pt or model.triton else bs, 3, *imgsz))  # warmup
     seen, windows, dt = 0, [], (Profile(), Profile(), Profile())
+
+    vid_path, vid_writer = [None] * bs, [None] * bs
+
     for path, im, im0s, vid_cap, s in dataset:
         with dt[0]:
             im = torch.from_numpy(im).to(model.device)
@@ -123,6 +137,7 @@ def run(weights='yolov5s.pt',  # model path
                 # Rescale boxes from img_size to im0 size
                 det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
 
+                annotator = Annotator(im0, line_width=line_thickness, example=str(names))
                 # Process detections and predict trajectories
                 im0 = track_predictor.process_frame(det, im0)
 
@@ -132,7 +147,7 @@ def run(weights='yolov5s.pt',  # model path
                     s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
 
             # Stream results
-            im0 = Annotator(im0, line_width=line_thickness, example=str(names))
+            # im0 = Annotator(im0, line_width=line_thickness, example=str(names))
 
             if view_img:
                 if platform.system() == 'Linux' and p not in windows:
@@ -157,6 +172,13 @@ def run(weights='yolov5s.pt',  # model path
                             h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                         else:  # stream
                             fps, w, h = 30, im0.shape[1], im0.shape[0]
+                            
+                        # Create output path
+                        if custom_output:
+                            # Use custom output path with original filename
+                            filename = Path(path).name
+                            save_path = str(Path(custom_output) / filename)
+                        
                         save_path = str(Path(save_path).with_suffix('.mp4'))  # force *.mp4 suffix on results videos
                         vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
                     vid_writer[i].write(im0)
@@ -172,8 +194,8 @@ def run(weights='yolov5s.pt',  # model path
 
 def parse_opt():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--weights', nargs='+', type=str, default='yolov5s.pt', help='model path or triton URL')
-    parser.add_argument('--source', type=str, default='data/images', help='file/dir/URL/glob/screen/0(webcam)')
+    parser.add_argument('--weights', nargs='+', type=str, default='yolov5s.pt', help='model path(s)')
+    parser.add_argument('--source', type=str, default='data/images', help='file/dir/URL/glob, 0 for webcam')
     parser.add_argument('--data', type=str, default='data/coco128.yaml', help='(optional) dataset.yaml path')
     parser.add_argument('--imgsz', '--img', '--img-size', nargs='+', type=int, default=[640], help='inference size h,w')
     parser.add_argument('--conf-thres', type=float, default=0.25, help='confidence threshold')
@@ -201,6 +223,7 @@ def parse_opt():
     parser.add_argument('--vid-stride', type=int, default=1, help='video frame-rate stride')
     parser.add_argument('--history-size', type=int, default=30, help='number of frames to keep in trajectory history')
     parser.add_argument('--future-steps', type=int, default=10, help='number of steps to predict into future')
+    parser.add_argument('--custom-output', type=str, default=None, help='custom output path for video')
     opt = parser.parse_args()
     opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
     print_args(vars(opt))
