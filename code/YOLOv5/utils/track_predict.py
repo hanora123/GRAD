@@ -6,6 +6,60 @@ import random
 from scipy.ndimage import gaussian_filter1d
 import math
 
+class KalmanFilter:
+    """Simple Kalman filter implementation for tracking"""
+    def __init__(self, dim_x, dim_z):
+        self.dim_x = dim_x
+        self.dim_z = dim_z
+        
+        # State estimate
+        self.x = np.zeros((dim_x, 1))
+        
+        # Covariance matrix
+        self.P = np.eye(dim_x)
+        
+        # State transition matrix
+        self.F = np.eye(dim_x)
+        
+        # Measurement matrix
+        self.H = np.zeros((dim_z, dim_x))
+        
+        # Measurement noise
+        self.R = np.eye(dim_z)
+        
+        # Process noise
+        self.Q = np.eye(dim_x)
+        
+    def predict(self):
+        """Predict next state"""
+        # x = Fx
+        self.x = np.dot(self.F, self.x)
+        
+        # P = FPF' + Q
+        self.P = np.dot(np.dot(self.F, self.P), self.F.T) + self.Q
+        
+        return self.x
+        
+    def update(self, z):
+        """Update state with measurement z"""
+        # y = z - Hx
+        y = z - np.dot(self.H, self.x)
+        
+        # S = HPH' + R
+        S = np.dot(np.dot(self.H, self.P), self.H.T) + self.R
+        
+        # K = PH'S^-1
+        K = np.dot(np.dot(self.P, self.H.T), np.linalg.inv(S))
+        
+        # x = x + Ky
+        self.x = self.x + np.dot(K, y)
+        
+        # P = (I - KH)P
+        I = np.eye(self.dim_x)
+        self.P = np.dot((I - np.dot(K, self.H)), self.P)
+        
+        return self.x
+
 class TrackPredictor:
     def __init__(self, history_size=30, future_steps=10, real_sizes=None):
         self.history_size = history_size
@@ -42,7 +96,70 @@ class TrackPredictor:
         
         # Decay factor for location history (older trajectories have less influence)
         self.history_decay = 0.95
+
+        # Kalman filters for each track
+        self.kalman_filters = {}
+
+        # Motion context learning
+        self.scene_flow_map = None
+        self.flow_update_rate = 0.05
         
+    def update_scene_flow(self, obj_id, positions):
+        """Update scene flow map with new trajectory data"""
+        if len(positions) < 2:
+            return
+            
+        if self.scene_flow_map is None:
+            # Initialize flow map on first use
+            h, w = 1080, 1920  # Default size, will be adjusted
+            self.scene_flow_map = np.zeros((h, w, 2), dtype=np.float32)
+            
+        # Update flow map with this trajectory
+        for i in range(1, len(positions)):
+            x1, y1 = positions[i-1]
+            x2, y2 = positions[i]
+            
+            # Calculate flow vector
+            flow_x = x2 - x1
+            flow_y = y2 - y1
+            
+            # Skip if out of bounds
+            if not (0 <= x1 < self.scene_flow_map.shape[1] and 0 <= y1 < self.scene_flow_map.shape[0]):
+                continue
+                
+            # Update flow map with exponential moving average
+            self.scene_flow_map[y1, x1, 0] = (1 - self.flow_update_rate) * self.scene_flow_map[y1, x1, 0] + self.flow_update_rate * flow_x
+            self.scene_flow_map[y1, x1, 1] = (1 - self.flow_update_rate) * self.scene_flow_map[y1, x1, 1] + self.flow_update_rate * flow_y
+    
+    def _initialize_kalman(self, track_id):
+        """Initialize a Kalman filter for a new track"""
+        kf = KalmanFilter(dim_x=4, dim_z=2)  # State: [x, vx, y, vy], Measurement: [x, y]
+        
+        # State transition matrix (constant velocity model)
+        kf.F = np.array([
+            [1, 1, 0, 0],  # x = x + vx
+            [0, 1, 0, 0],  # vx = vx
+            [0, 0, 1, 1],  # y = y + vy
+            [0, 0, 0, 1]   # vy = vy
+        ])
+        
+        # Measurement matrix (we only measure position, not velocity)
+        kf.H = np.array([
+            [1, 0, 0, 0],  # measure x
+            [0, 0, 1, 0]   # measure y
+        ])
+        
+        # Measurement noise
+        kf.R = np.eye(2) * 5.0  # Measurement uncertainty
+        
+        # Process noise
+        kf.Q = np.eye(4) * 0.1  # Process uncertainty
+        
+        # Initial state covariance
+        kf.P = np.eye(4) * 100.0  # High uncertainty in initial state
+        
+        return kf
+    
     def process_frame(self, detections, img, class_names, tracked_ids=None):
         """Process detections and draw trajectories
         
@@ -218,6 +335,34 @@ class TrackPredictor:
                     del self.class_tracks[track_id]
                 if track_id in self.colors:
                     del self.colors[track_id]
+                if track_id in self.kalman_filters:
+                    del self.kalman_filters[track_id]
+        
+        # Initialize or update Kalman filters for each track
+        for i, (*xyxy, conf, cls_id) in enumerate(detections):
+            # Get object ID
+            if tracked_ids is not None:
+                obj_id = int(tracked_ids[i])
+            else:
+                obj_id = i + 1
+                
+            # Get bounding box coordinates
+            x1, y1, x2, y2 = [int(coord) for coord in xyxy]
+                
+            # Calculate center point
+            center_x = (x1 + x2) // 2
+            center_y = y2
+            
+            # Initialize or update Kalman filter for this track
+            if obj_id not in self.kalman_filters:
+                self.kalman_filters[obj_id] = self._initialize_kalman(obj_id)
+                # Initialize state with first position and zero velocity
+                self.kalman_filters[obj_id].x = np.array([[center_x], [0], [center_y], [0]])
+            else:
+                # Predict
+                self.kalman_filters[obj_id].predict()
+                # Update with new measurement
+                self.kalman_filters[obj_id].update(np.array([[center_x], [center_y]]))
         
         return img.astype(np.uint8)
     
@@ -328,6 +473,38 @@ class TrackPredictor:
         if total_prob > 0:
             trajectories = [(traj, prob / total_prob) for traj, prob in trajectories]
         
+        # If we have a Kalman filter for this track, use it for prediction
+        obj_id = None
+        for id, positions in self.tracks.items():
+            if list(positions) == list(track):
+                obj_id = id
+                break
+                
+        if obj_id is not None and obj_id in self.kalman_filters:
+            kf = self.kalman_filters[obj_id]
+            
+            # Create a copy of the filter to avoid modifying the original
+            kf_copy = KalmanFilter(dim_x=4, dim_z=2)
+            kf_copy.x = kf.x.copy()
+            kf_copy.P = kf.P.copy()
+            kf_copy.F = kf.F.copy()
+            kf_copy.Q = kf.Q.copy()
+            
+            # Predict future trajectory using Kalman filter
+            kalman_trajectory = []
+            for _ in range(steps):
+                kf_copy.predict()
+                x = int(kf_copy.x[0, 0])
+                y = int(kf_copy.x[2, 0])
+                kalman_trajectory.append((x, y))
+            
+            # Add Kalman prediction as the most likely trajectory
+            trajectories.append((kalman_trajectory, 0.6))
+            
+            # Renormalize probabilities
+            total_prob = sum(prob for _, prob in trajectories)
+            trajectories = [(traj, prob / total_prob) for traj, prob in trajectories]
+        
         return trajectories
     
     def _sample_location_history(self, x, y, vx, vy):
@@ -340,70 +517,90 @@ class TrackPredictor:
         Returns:
             Dictionary with weights for different directions
         """
-        # Convert to integers
-        x, y = int(x), int(y)
-        
-        # Ensure coordinates are within bounds
-        h, w = self.location_history.shape
-        if not (0 <= x < w and 0 <= y < h):
+        # Normalize velocity vector
+        v_mag = np.sqrt(vx**2 + vy**2)
+        if v_mag < 0.001:  # Avoid division by zero
             return {'straight': 1.0, 'left': 0.5, 'right': 0.5}
+            
+        vx_norm, vy_norm = vx / v_mag, vy / v_mag
         
-        # Calculate direction angle
-        angle = math.atan2(vy, vx)
-        
-        # Sample points in different directions
+        # Sample points in front, left, and right of current position
         samples = {
             'straight': 0.0,
             'left': 0.0,
             'right': 0.0
         }
         
-        # Sample points ahead (straight)
-        straight_samples = []
-        for dist in range(10, 100, 10):
-            sample_x = int(x + dist * math.cos(angle))
-            sample_y = int(y + dist * math.sin(angle))
-            if 0 <= sample_x < w and 0 <= sample_y < h:
-                straight_samples.append(self.location_history[sample_y, sample_x])
+        # Sample count and distance
+        sample_count = 5
+        sample_dist = 20
         
-        if straight_samples:
-            samples['straight'] = np.mean(straight_samples)
+        # Get perpendicular vector (for left/right sampling)
+        perp_x, perp_y = -vy_norm, vx_norm
         
-        # Sample points to the left
-        left_samples = []
-        for dist in range(10, 100, 10):
-            sample_x = int(x + dist * math.cos(angle + math.pi/6))
-            sample_y = int(y + dist * math.sin(angle + math.pi/6))
-            if 0 <= sample_x < w and 0 <= sample_y < h:
-                left_samples.append(self.location_history[sample_y, sample_x])
+        # Sample straight ahead
+        for i in range(1, sample_count + 1):
+            # Sample point straight ahead
+            sx = int(x + vx_norm * i * sample_dist)
+            sy = int(y + vy_norm * i * sample_dist)
+            
+            # Check bounds
+            if 0 <= sx < self.location_history.shape[1] and 0 <= sy < self.location_history.shape[0]:
+                # Weight by distance (closer samples have more weight)
+                weight = 1.0 - (i - 1) / sample_count
+                samples['straight'] += self.location_history[sy, sx] * weight
         
-        if left_samples:
-            samples['left'] = np.mean(left_samples)
+        # Sample left
+        for i in range(1, sample_count + 1):
+            # Angle for sampling (from 0 to 45 degrees)
+            angle = i * (np.pi / 8) / sample_count
+            
+            # Rotate velocity vector to the left
+            rx = vx_norm * np.cos(angle) - vy_norm * np.sin(angle)
+            ry = vx_norm * np.sin(angle) + vy_norm * np.cos(angle)
+            
+            # Sample point
+            sx = int(x + rx * sample_dist)
+            sy = int(y + ry * sample_dist)
+            
+            # Check bounds
+            if 0 <= sx < self.location_history.shape[1] and 0 <= sy < self.location_history.shape[0]:
+                # Weight by distance and angle
+                weight = 1.0 - (i - 1) / sample_count
+                samples['left'] += self.location_history[sy, sx] * weight
         
-        # Sample points to the right
-        right_samples = []
-        for dist in range(10, 100, 10):
-            sample_x = int(x + dist * math.cos(angle - math.pi/6))
-            sample_y = int(y + dist * math.sin(angle - math.pi/6))
-            if 0 <= sample_x < w and 0 <= sample_y < h:
-                right_samples.append(self.location_history[sample_y, sample_x])
-        
-        if right_samples:
-            samples['right'] = np.mean(right_samples)
+        # Sample right
+        for i in range(1, sample_count + 1):
+            # Angle for sampling (from 0 to 45 degrees)
+            angle = i * (np.pi / 8) / sample_count
+            
+            # Rotate velocity vector to the right
+            rx = vx_norm * np.cos(angle) + vy_norm * np.sin(angle)
+            ry = -vx_norm * np.sin(angle) + vy_norm * np.cos(angle)
+            
+            # Sample point
+            sx = int(x + rx * sample_dist)
+            sy = int(y + ry * sample_dist)
+            
+            # Check bounds
+            if 0 <= sx < self.location_history.shape[1] and 0 <= sy < self.location_history.shape[0]:
+                # Weight by distance and angle
+                weight = 1.0 - (i - 1) / sample_count
+                samples['right'] += self.location_history[sy, sx] * weight
         
         # Normalize samples
         total = sum(samples.values())
         if total > 0:
-            for key in samples:
-                samples[key] /= total
+            for k in samples:
+                samples[k] /= total
         else:
-            # Default if no samples
+            # If no samples, use default weights
             samples = {'straight': 0.6, 'left': 0.2, 'right': 0.2}
         
         return samples
     
     def _adjust_pattern_weights(self, pattern, location_weights):
-        """Adjust pattern weights based on location history
+        """Adjust movement pattern weights based on location history
         
         Args:
             pattern: Original movement pattern
@@ -416,22 +613,43 @@ class TrackPredictor:
         adjusted = pattern.copy()
         
         # Adjust straight probability based on location history
-        straight_factor = 1.0 + location_weights['straight'] * 2.0
-        adjusted['straight'] = min(0.9, pattern['straight'] * straight_factor)
+        straight_factor = 1.0 + location_weights['straight'] * 0.5
+        adjusted['straight'] *= straight_factor
         
-        # Calculate remaining probability
-        remaining = 1.0 - adjusted['straight']
+        # Adjust turn probabilities based on location history
+        # If there's a strong history of turning, increase turn probability
+        turn_factor_left = 1.0 + location_weights['left'] * 0.5
+        turn_factor_right = 1.0 + location_weights['right'] * 0.5
         
-        # Distribute remaining probability between slight and sharp turns
-        turn_ratio = pattern['slight_turn'] / (pattern['slight_turn'] + pattern['sharp_turn'] + 1e-10)
+        # Split slight turn probability between left and right
+        slight_turn_total = adjusted['slight_turn']
+        adjusted['slight_turn_left'] = slight_turn_total * 0.5 * turn_factor_left
+        adjusted['slight_turn_right'] = slight_turn_total * 0.5 * turn_factor_right
+        del adjusted['slight_turn']
         
-        adjusted['slight_turn'] = remaining * turn_ratio
-        adjusted['sharp_turn'] = remaining * (1.0 - turn_ratio)
+        # Split sharp turn probability between left and right
+        sharp_turn_total = adjusted['sharp_turn']
+        adjusted['sharp_turn_left'] = sharp_turn_total * 0.5 * turn_factor_left
+        adjusted['sharp_turn_right'] = sharp_turn_total * 0.5 * turn_factor_right
+        del adjusted['sharp_turn']
         
-        return adjusted
+        # Normalize to ensure probabilities sum to 1.0
+        total = sum(adjusted.values())
+        if total > 0:
+            for k in adjusted:
+                adjusted[k] /= total
+        
+        # Recombine for return format
+        result = {
+            'straight': adjusted['straight'],
+            'slight_turn': adjusted['slight_turn_left'] + adjusted['slight_turn_right'],
+            'sharp_turn': adjusted['sharp_turn_left'] + adjusted['sharp_turn_right']
+        }
+        
+        return result
     
     def _get_turn_weights(self, location_weights, turn_type):
-        """Get weights for left and right turns
+        """Get weights for left and right turns based on location history
         
         Args:
             location_weights: Weights from location history
@@ -441,94 +659,372 @@ class TrackPredictor:
             (left_weight, right_weight) tuple
         """
         # Base weights
-        left = location_weights['left']
-        right = location_weights['right']
+        left_weight = 0.5
+        right_weight = 0.5
         
-        # Ensure they sum to 1.0
-        total = left + right
-        if total > 0:
-            left /= total
-            right /= total
-        else:
-            left, right = 0.5, 0.5
+        # Adjust based on location history
+        if location_weights['left'] > location_weights['right']:
+            # More history of left turns
+            factor = min(0.8, location_weights['left'] / max(0.001, location_weights['right']))
+            left_weight = 0.5 * (1.0 + factor * 0.5)
+            right_weight = 1.0 - left_weight
+        elif location_weights['right'] > location_weights['left']:
+            # More history of right turns
+            factor = min(0.8, location_weights['right'] / max(0.001, location_weights['left']))
+            right_weight = 0.5 * (1.0 + factor * 0.5)
+            left_weight = 1.0 - right_weight
         
-        # For sharp turns, exaggerate the difference
+        # For sharp turns, make the difference more pronounced
         if turn_type == 'sharp':
-            # Apply power function to increase contrast
-            left = left ** 0.7
-            right = right ** 0.7
+            # Exaggerate the difference
+            diff = left_weight - right_weight
+            left_weight = 0.5 + diff * 1.5
+            right_weight = 1.0 - left_weight
+            
+            # Clamp to valid range
+            left_weight = max(0.1, min(0.9, left_weight))
+            right_weight = max(0.1, min(0.9, right_weight))
             
             # Renormalize
-            total = left + right
-            left /= total
-            right /= total
+            total = left_weight + right_weight
+            left_weight /= total
+            right_weight /= total
         
-        return left, right
+        return left_weight, right_weight
     
-    def _predict_straight_trajectory(self, start_pos, vx, vy, steps):
-        """Predict a straight trajectory with some noise"""
+    def _sample_location_history(self, x, y, vx, vy):
+        """Sample location history to determine common turning patterns
+        
+        Args:
+            x, y: Current position
+            vx, vy: Current velocity vector
+            
+        Returns:
+            Dictionary with weights for different directions
+        """
+        # Initialize weights
+        weights = {
+            'straight': 0.0,
+            'left': 0.0,
+            'right': 0.0
+        }
+        
+        # If velocity is too small, return default weights
+        velocity_mag = np.sqrt(vx**2 + vy**2)
+        if velocity_mag < 1.0:
+            return {'straight': 1.0, 'left': 0.5, 'right': 0.5}
+        
+        # Normalize velocity vector
+        nvx = vx / velocity_mag
+        nvy = vy / velocity_mag
+        
+        # Calculate perpendicular vectors (left and right)
+        left_vx, left_vy = -nvy, nvx  # 90 degrees counter-clockwise
+        right_vx, right_vy = nvy, -nvx  # 90 degrees clockwise
+        
+        # Sample points in front, left, and right
+        samples = 10
+        max_dist = 50  # Maximum sampling distance
+        
+        # Sample straight ahead
+        straight_sum = 0.0
+        for i in range(1, samples + 1):
+            dist = i * (max_dist / samples)
+            sample_x = int(x + nvx * dist)
+            sample_y = int(y + nvy * dist)
+            
+            # Check if within bounds
+            if 0 <= sample_x < self.location_history.shape[1] and 0 <= sample_y < self.location_history.shape[0]:
+                straight_sum += self.location_history[sample_y, sample_x]
+        
+        # Sample left
+        left_sum = 0.0
+        for i in range(1, samples + 1):
+            dist = i * (max_dist / samples)
+            # Mix of forward and left vectors
+            mix_factor = i / samples  # Gradually increase left component
+            sample_x = int(x + (nvx * (1.0 - mix_factor) + left_vx * mix_factor) * dist)
+            sample_y = int(y + (nvy * (1.0 - mix_factor) + left_vy * mix_factor) * dist)
+            
+            # Check if within bounds
+            if 0 <= sample_x < self.location_history.shape[1] and 0 <= sample_y < self.location_history.shape[0]:
+                left_sum += self.location_history[sample_y, sample_x]
+        
+        # Sample right
+        right_sum = 0.0
+        for i in range(1, samples + 1):
+            dist = i * (max_dist / samples)
+            # Mix of forward and right vectors
+            mix_factor = i / samples  # Gradually increase right component
+            sample_x = int(x + (nvx * (1.0 - mix_factor) + right_vx * mix_factor) * dist)
+            sample_y = int(y + (nvy * (1.0 - mix_factor) + right_vy * mix_factor) * dist)
+            
+            # Check if within bounds
+            if 0 <= sample_x < self.location_history.shape[1] and 0 <= sample_y < self.location_history.shape[0]:
+                right_sum += self.location_history[sample_y, sample_x]
+        
+        # Normalize weights
+        total_sum = straight_sum + left_sum + right_sum
+        if total_sum > 0:
+            weights['straight'] = straight_sum / total_sum
+            weights['left'] = left_sum / total_sum
+            weights['right'] = right_sum / total_sum
+        else:
+            # Default weights if no history
+            weights['straight'] = 0.6
+            weights['left'] = 0.2
+            weights['right'] = 0.2
+        
+        return weights
+    
+    def _adjust_pattern_weights(self, pattern, location_weights):
+        """Adjust movement pattern weights based on location history
+        
+        Args:
+            pattern: Base movement pattern
+            location_weights: Weights from location history
+            
+        Returns:
+            Adjusted pattern
+        """
+        # Create a copy of the pattern
+        adjusted = pattern.copy()
+        
+        # Adjust straight probability based on location history
+        straight_factor = location_weights['straight'] / 0.6  # Normalize relative to default
+        adjusted['straight'] = pattern['straight'] * straight_factor
+        
+        # Adjust turn probabilities
+        turn_total = pattern['slight_turn'] + pattern['sharp_turn']
+        if turn_total > 0:
+            # Calculate left vs right bias from location weights
+            left_right_ratio = location_weights['left'] / max(0.001, location_weights['right'])
+            
+            # If strong bias to one side, increase turn probability in that direction
+            if left_right_ratio > 1.5 or left_right_ratio < 0.67:
+                turn_boost = min(1.5, max(1.0, abs(left_right_ratio - 1.0) * 0.5 + 1.0))
+                adjusted['slight_turn'] = pattern['slight_turn'] * turn_boost
+                adjusted['sharp_turn'] = pattern['sharp_turn'] * turn_boost
+        
+        # Normalize to ensure probabilities sum to 1.0
+        total = sum(adjusted.values())
+        if total > 0:
+            for key in adjusted:
+                adjusted[key] /= total
+        
+        return adjusted
+
+    def _predict_straight_trajectory(self, current_pos, vx, vy, steps):
+        """Predict a straight trajectory based on current position and velocity
+        
+        Args:
+            current_pos: Current position (x, y)
+            vx: Velocity in x direction
+            vy: Velocity in y direction
+            steps: Number of steps to predict
+            
+        Returns:
+            List of predicted positions [(x1, y1), (x2, y2), ...]
+        """
         trajectory = []
-        x, y = start_pos
+        x, y = current_pos
         
-        for i in range(1, steps + 1):
-            # Add small random noise to make it more realistic
-            noise_x = random.gauss(0, 0.5) * i
-            noise_y = random.gauss(0, 0.5) * i
+        for i in range(steps):
+            # Add small random noise to make prediction more realistic
+            noise_x = random.uniform(-0.5, 0.5) * min(1.0, abs(vx) * 0.1)
+            noise_y = random.uniform(-0.5, 0.5) * min(1.0, abs(vy) * 0.1)
             
-            # Apply damping for more realistic prediction
-            damping = 0.95 ** i
+            # Update position based on velocity
+            x = x + vx + noise_x
+            y = y + vy + noise_y
             
-            next_x = x + vx * i * damping + noise_x
-            next_y = y + vy * i * damping + noise_y
+            trajectory.append((x, y))
             
-            trajectory.append((next_x, next_y))
-        
         return trajectory
     
-    def _predict_turning_trajectory(self, start_pos, vx, vy, steps, turn_angle=30, smoothing=0.7):
+    def _predict_turning_trajectory(self, current_pos, vx, vy, steps, turn_angle=15, smoothing=0.8):
         """Predict a turning trajectory
         
         Args:
-            start_pos: Starting position (x, y)
-            vx, vy: Initial velocity components
+            current_pos: Current position (x, y)
+            vx: Velocity in x direction
+            vy: Velocity in y direction
             steps: Number of steps to predict
             turn_angle: Angle to turn in degrees (positive=left, negative=right)
-            smoothing: How smooth the turn should be (0-1)
+            smoothing: How smooth the turn should be (0-1, higher=smoother)
+            
+        Returns:
+            List of predicted positions [(x1, y1), (x2, y2), ...]
         """
         trajectory = []
-        x, y = start_pos
+        x, y = current_pos
         
-        # Convert angle to radians
+        # Convert velocity to speed and direction
+        speed = math.sqrt(vx**2 + vy**2)
+        angle = math.atan2(vy, vx)
+        
+        # Convert turn angle to radians
         turn_angle_rad = math.radians(turn_angle)
         
-        # Calculate initial direction angle
-        initial_angle = math.atan2(vy, vx)
+        # Total angle to turn over the trajectory
+        total_turn = turn_angle_rad
         
-        # Calculate speed (magnitude of velocity)
-        speed = math.sqrt(vx**2 + vy**2)
-        
-        for i in range(1, steps + 1):
-            # Calculate progress through the turn (0 to 1)
-            progress = min(1.0, i / (steps * smoothing))
+        for i in range(steps):
+            # Calculate turn for this step (apply more turn in the middle of trajectory)
+            progress = i / (steps - 1) if steps > 1 else 0
+            turn_weight = 4 * progress * (1 - progress)  # Parabolic weight, max at 0.5
+            step_turn = total_turn * turn_weight * (1 - smoothing)
             
-            # Calculate current angle with gradual turn
-            current_angle = initial_angle + turn_angle_rad * progress
-            
-            # Calculate velocity components at this angle
-            current_vx = speed * math.cos(current_angle)
-            current_vy = speed * math.sin(current_angle)
+            # Update angle with turn
+            angle += step_turn
             
             # Add small random noise
-            noise_x = random.gauss(0, 0.5) * i
-            noise_y = random.gauss(0, 0.5) * i
+            noise_angle = random.uniform(-0.02, 0.02)
+            angle += noise_angle
             
-            # Apply damping for more realistic prediction
-            damping = 0.95 ** i
+            # Calculate new velocity components
+            new_vx = speed * math.cos(angle)
+            new_vy = speed * math.sin(angle)
             
-            # Calculate next position
-            next_x = x + current_vx * i * damping + noise_x
-            next_y = y + current_vy * i * damping + noise_y
+            # Update position
+            x = x + new_vx
+            y = y + new_vy
             
-            trajectory.append((next_x, next_y))
-        
+            trajectory.append((x, y))
+            
         return trajectory
+    
+    def _sample_location_history(self, x, y, vx, vy):
+        """Sample the location history in the direction of movement
+        
+        Args:
+            x, y: Current position
+            vx, vy: Velocity vector
+            
+        Returns:
+            Dictionary with weights for different directions
+        """
+        # Default weights
+        weights = {
+            'straight': 1.0,
+            'left': 0.5,
+            'right': 0.5
+        }
+        
+        # If no significant motion or no history data, return default weights
+        if abs(vx) < 0.1 and abs(vy) < 0.1:
+            return weights
+            
+        # Calculate direction angle
+        angle = math.atan2(vy, vx)
+        
+        # Sample points ahead in different directions
+        straight_samples = []
+        left_samples = []
+        right_samples = []
+        
+        # Distance to sample
+        sample_dist = 30
+        
+        # Sample straight ahead
+        for d in range(10, sample_dist, 5):
+            sample_x = int(x + d * math.cos(angle))
+            sample_y = int(y + d * math.sin(angle))
+            
+            if 0 <= sample_x < self.location_history.shape[1] and 0 <= sample_y < self.location_history.shape[0]:
+                straight_samples.append(self.location_history[sample_y, sample_x])
+        
+        # Sample left
+        left_angle = angle + math.pi/6  # 30 degrees left
+        for d in range(10, sample_dist, 5):
+            sample_x = int(x + d * math.cos(left_angle))
+            sample_y = int(y + d * math.sin(left_angle))
+            
+            if 0 <= sample_x < self.location_history.shape[1] and 0 <= sample_y < self.location_history.shape[0]:
+                left_samples.append(self.location_history[sample_y, sample_x])
+        
+        # Sample right
+        right_angle = angle - math.pi/6  # 30 degrees right
+        for d in range(10, sample_dist, 5):
+            sample_x = int(x + d * math.cos(right_angle))
+            sample_y = int(y + d * math.sin(right_angle))
+            
+            if 0 <= sample_x < self.location_history.shape[1] and 0 <= sample_y < self.location_history.shape[0]:
+                right_samples.append(self.location_history[sample_y, sample_x])
+        
+        # Calculate average values
+        straight_avg = sum(straight_samples) / max(len(straight_samples), 1)
+        left_avg = sum(left_samples) / max(len(left_samples), 1)
+        right_avg = sum(right_samples) / max(len(right_samples), 1)
+        
+        # Normalize to get weights
+        total = straight_avg + left_avg + right_avg
+        if total > 0:
+            weights['straight'] = straight_avg / total
+            weights['left'] = left_avg / total
+            weights['right'] = right_avg / total
+        
+        return weights
+    
+    def _adjust_pattern_weights(self, pattern, location_weights):
+        """Adjust movement pattern weights based on location history
+        
+        Args:
+            pattern: Original movement pattern
+            location_weights: Weights from location history
+            
+        Returns:
+            Adjusted pattern
+        """
+        # Copy original pattern
+        adjusted = pattern.copy()
+        
+        # Adjust straight probability based on location history
+        straight_factor = location_weights['straight'] * 2  # Amplify the effect
+        adjusted['straight'] = pattern['straight'] * straight_factor
+        
+        # Adjust turn probabilities
+        turn_total = pattern['slight_turn'] + pattern['sharp_turn']
+        if turn_total > 0:
+            # Calculate left vs right bias from location weights
+            left_weight = location_weights['left'] / (location_weights['left'] + location_weights['right'])
+            right_weight = 1 - left_weight
+            
+            # Store these for use in trajectory generation
+            self.left_turn_bias = left_weight
+            self.right_turn_bias = right_weight
+        
+        # Normalize to ensure probabilities sum to 1
+        total = sum(adjusted.values())
+        if total > 0:
+            for k in adjusted:
+                adjusted[k] /= total
+        
+        return adjusted
+    
+    def _get_turn_weights(self, location_weights, turn_type):
+        """Get weights for left vs right turns
+        
+        Args:
+            location_weights: Weights from location history
+            turn_type: 'slight' or 'sharp'
+            
+        Returns:
+            (left_weight, right_weight) tuple
+        """
+        # Calculate left vs right bias from location weights
+        left_weight = location_weights['left'] / (location_weights['left'] + location_weights['right'])
+        right_weight = 1 - left_weight
+        
+        # For sharp turns, exaggerate the bias
+        if turn_type == 'sharp':
+            # Exaggerate the bias for sharp turns
+            left_weight = left_weight ** 0.7  # Reduce the exponent to make bias less extreme
+            right_weight = right_weight ** 0.7
+            
+            # Renormalize
+            total = left_weight + right_weight
+            left_weight /= total
+            right_weight /= total
+        
+        return left_weight, right_weight

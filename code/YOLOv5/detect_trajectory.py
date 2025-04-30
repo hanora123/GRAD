@@ -160,11 +160,11 @@ def run(weights='yolov5s.pt',  # model path
         real_sizes=config['General']['Real Size (cm)']
     )
     
-    # Initialize SORT tracker with parameters from TDNet configuration
+    # Initialize SORT tracker with better parameters
     sort_tracker = SORT(
-        max_age=30,     # Maximum frames to keep object without detection
-        min_hits=3,     # Minimum detection hits to start tracking
-        iou_threshold=0.2  # IOU threshold for matching
+        max_age=30,           # Allow tracks to remain inactive longer before deletion
+        min_hits=3,           # Require more hits to establish a track
+        iou_threshold=0.3     # Lower IOU threshold to maintain tracking in challenging scenarios
     )
 
     # Dataloader
