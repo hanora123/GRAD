@@ -2,6 +2,8 @@ import cv2
 import numpy as np
 import torch
 from collections import defaultdict, deque
+import random
+from scipy.ndimage import gaussian_filter1d
 
 class TrackPredictor:
     def __init__(self, history_size=30, future_steps=10, real_sizes=None):
@@ -11,6 +13,24 @@ class TrackPredictor:
         self.tracks = defaultdict(lambda: deque(maxlen=history_size))
         self.class_tracks = {}  # Track class for each ID
         self.colors = {}  # Consistent colors for each ID
+        self.movement_patterns = {
+            'person': {
+                'straight': 0.6,    # 60% chance to continue straight
+                'slight_turn': 0.3, # 30% chance to make slight turns
+                'sharp_turn': 0.1   # 10% chance to make sharp turns
+            },
+            'car': {
+                'straight': 0.7,    # 70% chance to continue straight (cars tend to move more predictably)
+                'slight_turn': 0.25, # 25% chance to make slight turns
+                'sharp_turn': 0.05  # 5% chance to make sharp turns
+            }
+        }
+        # Default pattern for other classes
+        self.default_pattern = {
+            'straight': 0.6,
+            'slight_turn': 0.3,
+            'sharp_turn': 0.1
+        }
         
     def process_frame(self, detections, img, class_names, tracked_ids=None):
         """Process detections and draw trajectories
@@ -78,14 +98,49 @@ class TrackPredictor:
             
             # Predict future trajectory if we have enough history
             if len(self.tracks[obj_id]) >= 2:
-                future_points = self._predict_trajectory(self.tracks[obj_id], self.future_steps)
+                # Get multiple possible trajectories with weights
+                future_trajectories = self._predict_weighted_trajectories(
+                    self.tracks[obj_id], 
+                    self.future_steps, 
+                    cls_name.lower()
+                )
                 
-                # Draw predicted trajectory
-                last_point = self.tracks[obj_id][-1]
-                for point in future_points:
-                    cv2.line(img, last_point, point, (255, 255, 255), 1, cv2.LINE_AA)
-                    cv2.circle(img, point, 3, color, -1)
-                    last_point = point
+                # Draw each possible trajectory with opacity based on probability
+                for trajectory, probability in future_trajectories:
+                    # Adjust alpha (transparency) based on probability
+                    alpha = min(1.0, probability * 2)  # Scale up for visibility
+                    
+                    # Create a color with alpha for this trajectory
+                    # Higher probability = more solid line
+                    traj_color = (
+                        int(color[0] * alpha),
+                        int(color[1] * alpha),
+                        int(color[2] * alpha)
+                    )
+                    
+                    # Draw the trajectory
+                    last_point = self.tracks[obj_id][-1]
+                    for point in trajectory:
+                        # Convert to integer coordinates
+                        point = (int(point[0]), int(point[1]))
+                        
+                        # Draw line segment
+                        cv2.line(img, last_point, point, traj_color, 
+                                int(1 + probability * 2), cv2.LINE_AA)
+                        
+                        # Draw small circle at each prediction point
+                        circle_size = int(2 + probability * 3)
+                        cv2.circle(img, point, circle_size, traj_color, -1)
+                        
+                        last_point = point
+                    
+                    # Add probability text at the end of each trajectory
+                    if len(trajectory) > 0:
+                        end_point = trajectory[-1]
+                        prob_text = f"{probability:.2f}"
+                        cv2.putText(img, prob_text, 
+                                   (int(end_point[0]), int(end_point[1])),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, traj_color, 1)
         
         # Clean up old tracks that haven't been updated
         current_ids = set([int(tracked_ids[i]) for i in range(len(tracked_ids))] if tracked_ids is not None 
@@ -108,10 +163,22 @@ class TrackPredictor:
         
         return img
     
-    def _predict_trajectory(self, track, steps):
-        """Predict future trajectory based on past positions"""
+    def _predict_weighted_trajectories(self, track, steps, class_name):
+        """Predict multiple possible future trajectories with weights
+        
+        Args:
+            track: List of past positions [(x1, y1), (x2, y2), ...]
+            steps: Number of steps to predict into future
+            class_name: Class name of the object (person, car, etc.)
+            
+        Returns:
+            List of (trajectory, probability) tuples
+        """
         if len(track) < 2:
             return []
+        
+        # Get movement pattern for this class
+        pattern = self.movement_patterns.get(class_name, self.default_pattern)
         
         # Use the last few points to calculate velocity
         positions = list(track)
@@ -129,15 +196,139 @@ class TrackPredictor:
         avg_vx = sum(v[0] for v in velocities) / len(velocities)
         avg_vy = sum(v[1] for v in velocities) / len(velocities)
         
-        # Predict future positions
-        future_points = []
-        last_x, last_y = positions[-1]
+        # Calculate velocity magnitude and direction
+        velocity_mag = np.sqrt(avg_vx**2 + avg_vy**2)
+        
+        # If object is nearly stationary, return single trajectory
+        if velocity_mag < 1.0:
+            # Just predict straight line with small random movement
+            trajectory = self._predict_straight_trajectory(positions[-1], avg_vx, avg_vy, steps)
+            return [(trajectory, 1.0)]
+        
+        # Generate multiple trajectories based on movement patterns
+        trajectories = []
+        
+        # 1. Straight trajectory
+        if pattern['straight'] > 0:
+            straight_traj = self._predict_straight_trajectory(positions[-1], avg_vx, avg_vy, steps)
+            trajectories.append((straight_traj, pattern['straight']))
+        
+        # 2. Slight turn trajectories (left and right)
+        if pattern['slight_turn'] > 0:
+            # Split probability between left and right turns
+            turn_prob = pattern['slight_turn'] / 2
+            
+            # Left slight turn
+            left_slight = self._predict_turning_trajectory(
+                positions[-1], avg_vx, avg_vy, steps, turn_angle=15, smoothing=0.8
+            )
+            trajectories.append((left_slight, turn_prob))
+            
+            # Right slight turn
+            right_slight = self._predict_turning_trajectory(
+                positions[-1], avg_vx, avg_vy, steps, turn_angle=-15, smoothing=0.8
+            )
+            trajectories.append((right_slight, turn_prob))
+        
+        # 3. Sharp turn trajectories (left and right)
+        if pattern['sharp_turn'] > 0:
+            # Split probability between left and right turns
+            turn_prob = pattern['sharp_turn'] / 2
+            
+            # Left sharp turn
+            left_sharp = self._predict_turning_trajectory(
+                positions[-1], avg_vx, avg_vy, steps, turn_angle=45, smoothing=0.6
+            )
+            trajectories.append((left_sharp, turn_prob))
+            
+            # Right sharp turn
+            right_sharp = self._predict_turning_trajectory(
+                positions[-1], avg_vx, avg_vy, steps, turn_angle=-45, smoothing=0.6
+            )
+            trajectories.append((right_sharp, turn_prob))
+        
+        return trajectories
+    
+    def _predict_straight_trajectory(self, start_pos, vx, vy, steps):
+        """Predict a straight trajectory with some noise"""
+        trajectory = []
+        x, y = start_pos
         
         for i in range(1, steps + 1):
-            # Apply some damping to make predictions more realistic
-            damping = 0.9 ** i
-            next_x = int(last_x + avg_vx * i * damping)
-            next_y = int(last_y + avg_vy * i * damping)
-            future_points.append((next_x, next_y))
+            # Add small random noise to make it more realistic
+            noise_x = random.gauss(0, 0.5) * i
+            noise_y = random.gauss(0, 0.5) * i
+            
+            # Apply damping for more realistic prediction
+            damping = 0.95 ** i
+            
+            next_x = x + vx * i * damping + noise_x
+            next_y = y + vy * i * damping + noise_y
+            
+            trajectory.append((next_x, next_y))
         
-        return future_points
+        return trajectory
+    
+    def _predict_turning_trajectory(self, start_pos, vx, vy, steps, turn_angle=30, smoothing=0.7):
+        """Predict a turning trajectory
+        
+        Args:
+            start_pos: Starting position (x, y)
+            vx, vy: Initial velocity components
+            steps: Number of steps to predict
+            turn_angle: Angle to turn in degrees (positive=left, negative=right)
+            smoothing: How smooth the turn should be (0-1)
+        """
+        trajectory = []
+        x, y = start_pos
+        
+        # Convert velocity to polar coordinates
+        speed = np.sqrt(vx**2 + vy**2)
+        angle = np.arctan2(vy, vx)
+        
+        # Convert turn angle to radians
+        turn_angle_rad = np.radians(turn_angle)
+        
+        # Total angle to distribute over steps
+        total_angle_change = turn_angle_rad
+        
+        # Generate raw points with increasing turn
+        raw_points = []
+        for i in range(1, steps + 1):
+            # Calculate how much to turn at this step (more turn as we go further)
+            # Using a sigmoid-like function to make turn more natural
+            progress = i / steps
+            turn_progress = 1 / (1 + np.exp(-10 * (progress - 0.5)))
+            
+            # Apply the turn progressively
+            current_angle = angle + total_angle_change * turn_progress
+            
+            # Calculate new position
+            damping = 0.95 ** i  # Slow down a bit over time
+            step_distance = speed * damping
+            
+            next_x = x + step_distance * np.cos(current_angle)
+            next_y = y + step_distance * np.sin(current_angle)
+            
+            raw_points.append((next_x, next_y))
+            
+            # Update for next iteration
+            x, y = next_x, next_y
+        
+        # Apply smoothing if needed
+        if smoothing > 0 and len(raw_points) > 2:
+            # Extract x and y coordinates
+            xs = np.array([p[0] for p in raw_points])
+            ys = np.array([p[1] for p in raw_points])
+            
+            # Apply Gaussian smoothing
+            sigma = (1 - smoothing) * 5 + 0.1  # Convert smoothing factor to sigma
+            xs_smooth = gaussian_filter1d(xs, sigma)
+            ys_smooth = gaussian_filter1d(ys, sigma)
+            
+            # Recombine into trajectory
+            trajectory = list(zip(xs_smooth, ys_smooth))
+        else:
+            trajectory = raw_points
+        
+        return trajectory
