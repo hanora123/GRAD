@@ -68,6 +68,7 @@ class TrackPredictor:
         self.tracks = defaultdict(lambda: deque(maxlen=history_size))
         self.class_tracks = {}  # Track class for each ID
         self.colors = {}  # Consistent colors for each ID
+        self.frame_number = 0  # Initialize frame counter
         self.movement_patterns = {
             'person': {
                 'straight': 0.6,    # 60% chance to continue straight
@@ -168,8 +169,17 @@ class TrackPredictor:
             img: Image to draw on
             class_names: Dictionary of class names
             tracked_ids: Optional array of tracked IDs corresponding to detections
+            
+        Returns:
+            tuple: (processed image, prediction data dictionary)
         """
         height, width = img.shape[:2]
+        
+        # Increment frame counter
+        self.frame_number += 1
+        
+        # Initialize prediction data dictionary
+        prediction_data = {}
         
         # Resize location history if needed
         if self.location_history.shape[0] != height or self.location_history.shape[1] != width:
@@ -251,6 +261,15 @@ class TrackPredictor:
                 
                 # Create a heat map for this object's predicted trajectories
                 obj_heat_map = np.zeros((height, width), dtype=np.float32)
+                
+                # Store prediction data
+                prediction_data[obj_id] = {
+                    'class': cls_name,
+                    'current_position': self.tracks[obj_id][-1],
+                    'history': list(self.tracks[obj_id]),
+                    'trajectories': future_trajectories,
+                    'frame_number': getattr(self, 'frame_number', 0)
+                }
                 
                 # Draw each possible trajectory with opacity based on probability
                 for trajectory, probability in future_trajectories:
@@ -364,7 +383,7 @@ class TrackPredictor:
                 # Update with new measurement
                 self.kalman_filters[obj_id].update(np.array([[center_x], [center_y]]))
         
-        return img.astype(np.uint8)
+        return img.astype(np.uint8), prediction_data
     
     def _predict_weighted_trajectories(self, track, steps, class_name):
         """Predict multiple possible future trajectories with weights

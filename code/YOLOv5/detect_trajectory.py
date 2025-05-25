@@ -31,6 +31,11 @@ from utils.track_predict import TrackPredictor
 # Import SORT tracker from TDNet using absolute import
 from TDNet.Trakers import SORT
 
+# Add these imports at the top
+import csv
+import json
+from datetime import datetime
+
 @smart_inference_mode()
 def run(weights='yolov5s.pt',  # model path
         source='data/images',  # file/dir/URL/glob/screen/0(webcam)
@@ -62,6 +67,7 @@ def run(weights='yolov5s.pt',  # model path
         history_size=30,  # number of frames to keep in trajectory history
         future_steps=10,  # number of steps to predict into future
         custom_output=None,  # custom output path for video
+        save_predictions=False,  # save trajectory predictions to CSV and JSON files
         ):
     source = str(source)
     save_img = not nosave and not source.endswith('.txt')  # save inference images
@@ -93,6 +99,31 @@ def run(weights='yolov5s.pt',  # model path
     
     LOGGER.info(f': Video Folder Created: {video_dir}')
     LOGGER.info(f': Figure Folder Created: {figure_dir}')
+    
+    # Initialize prediction saving if requested
+    all_predictions = {}
+    csv_writer = None
+    predictions_csv = None
+    predictions_json = None
+    csv_file = None  # Add this line to store the file object
+    
+    if save_predictions:
+        # Create predictions directory
+        predictions_dir = os.path.join(output_base, 'Predictions')
+        os.makedirs(predictions_dir, exist_ok=True)
+        
+        # Setup CSV file for saving trajectory predictions
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        predictions_csv = os.path.join(predictions_dir, f'trajectory_predictions_{timestamp}.csv')
+        predictions_json = os.path.join(predictions_dir, f'trajectory_predictions_{timestamp}.json')
+        
+        # Initialize CSV file with headers - keep the file open
+        csv_file = open(predictions_csv, 'w', newline='')  # Store the file object
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow(['frame', 'object_id', 'class', 'current_x', 'current_y', 
+                           'prediction_type', 'probability', 'trajectory'])
+        
+        LOGGER.info(f': Predictions will be saved to {predictions_csv} and {predictions_json}')
     
     # Create configuration file
     config = {
@@ -236,44 +267,56 @@ def run(weights='yolov5s.pt',  # model path
                         tracked_tensor[j, 5] = torch.tensor(det[j, 5])   # class
                         
                     # Process with consistent IDs from tracker
-                    im0 = track_predictor.process_frame(tracked_tensor, im0, names, tracked_ids=tracked_dets[:, 4])
+                    # Update to capture returned prediction data
+                    im0, prediction_data = track_predictor.process_frame(tracked_tensor, im0, names, tracked_ids=tracked_dets[:, 4])
+                    
+                    # Save prediction data if requested
+                    if save_predictions and prediction_data:
+                        # Save to CSV
+                        for obj_id, data in prediction_data.items():
+                            current_x, current_y = data['current_position']
+                            for trajectory, probability in data['trajectories']:
+                                trajectory_str = json.dumps(trajectory)
+                                csv_writer.writerow([track_predictor.frame_number, obj_id, data['class'], 
+                                               current_x, current_y, 'prediction', 
+                                               probability, trajectory_str])
                 else:
                     # If no tracked detections, process original detections
                     im0 = track_predictor.process_frame(det, im0, names)
+            
+            # Print results
+            for c in det[:, 5].unique():
+                n = (det[:, 5] == c).sum()  # detections per class
+                s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
 
-                # Print results
-                for c in det[:, 5].unique():
-                    n = (det[:, 5] == c).sum()  # detections per class
-                    s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
+        # Stream results
+        if view_img:
+            if platform.system() == 'Linux' and p not in windows:
+                windows.append(p)
+                cv2.namedWindow(str(p), cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)  # allow window resize (Linux)
+                cv2.resizeWindow(str(p), im0.shape[1], im0.shape[0])
+            cv2.imshow(str(p), im0)
+            cv2.waitKey(1)  # 1 millisecond
 
-            # Stream results
-            if view_img:
-                if platform.system() == 'Linux' and p not in windows:
-                    windows.append(p)
-                    cv2.namedWindow(str(p), cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)  # allow window resize (Linux)
-                    cv2.resizeWindow(str(p), im0.shape[1], im0.shape[0])
-                cv2.imshow(str(p), im0)
-                cv2.waitKey(1)  # 1 millisecond
-
-            # Save results (image with detections)
-            if save_img:
-                if dataset.mode == 'image':
-                    cv2.imwrite(save_path, im0)
-                else:  # 'video' or 'stream'
-                    if vid_path[i] != save_path:  # new video
-                        vid_path[i] = save_path
-                        if isinstance(vid_writer[i], cv2.VideoWriter):
-                            vid_writer[i].release()  # release previous video writer
-                        if vid_cap:  # video
-                            fps = vid_cap.get(cv2.CAP_PROP_FPS)
-                            w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                            h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                        else:  # stream
-                            fps, w, h = 30, im0.shape[1], im0.shape[0]
-                        save_path = str(Path(save_path).with_suffix('.mp4'))  # force *.mp4 suffix on results videos
-                        # Use DIVX codec as in TDNet
-                        vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*config['System']['Video Format']), fps, (w, h))
-                    vid_writer[i].write(im0)
+        # Save results (image with detections)
+        if save_img:
+            if dataset.mode == 'image':
+                cv2.imwrite(save_path, im0)
+            else:  # 'video' or 'stream'
+                if vid_path[i] != save_path:  # new video
+                    vid_path[i] = save_path
+                    if isinstance(vid_writer[i], cv2.VideoWriter):
+                        vid_writer[i].release()  # release previous video writer
+                    if vid_cap:  # video
+                        fps = vid_cap.get(cv2.CAP_PROP_FPS)
+                        w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                        h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    else:  # stream
+                        fps, w, h = 30, im0.shape[1], im0.shape[0]
+                    save_path = str(Path(save_path).with_suffix('.mp4'))  # force *.mp4 suffix on results videos
+                    # Use DIVX codec as in TDNet
+                    vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*config['System']['Video Format']), fps, (w, h))
+                vid_writer[i].write(im0)
 
         # Print time (inference-only)
         LOGGER.info(f"{s}{'' if len(det) else '(no detections), '}{dt[1].dt * 1E3:.1f}ms")
@@ -286,6 +329,16 @@ def run(weights='yolov5s.pt',  # model path
         LOGGER.info(f"Results saved to {colorstr('bold', Path(output_base))}{s}")
     if update:
         strip_optimizer(weights)
+        
+    # Save all prediction data as JSON if requested
+    if save_predictions and all_predictions:
+        with open(predictions_json, 'w') as f:
+            json.dump(all_predictions, f, indent=2)
+        LOGGER.info(f"Complete prediction data saved to {predictions_json}")
+    
+    # Close the CSV file if it was opened
+    if csv_file is not None:
+        csv_file.close()
 
 def parse_opt():
     parser = argparse.ArgumentParser()
@@ -319,6 +372,7 @@ def parse_opt():
     parser.add_argument('--history-size', type=int, default=30, help='number of frames to keep in trajectory history')
     parser.add_argument('--future-steps', type=int, default=10, help='number of steps to predict into future')
     parser.add_argument('--custom-output', type=str, default=None, help='custom output path for video')
+    parser.add_argument('--save-predictions', action='store_true', help='save trajectory predictions to CSV file')
     opt = parser.parse_args()
     opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
     print_args(vars(opt))
