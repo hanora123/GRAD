@@ -37,8 +37,10 @@ import json
 from datetime import datetime
 
 @smart_inference_mode()
-def run(weights='yolov5s.pt',  # model path
-        source='data/images',  # file/dir/URL/glob/screen/0(webcam)
+@torch.no_grad()
+def run(
+        weights=ROOT / 'yolov5s.pt',  # model.pt path(s)
+        source=ROOT / 'data/images',  # file/dir/URL/glob, 0 for webcam
         data='data/coco128.yaml',  # dataset.yaml path
         imgsz=(640, 640),  # inference size (height, width)
         conf_thres=0.25,  # confidence threshold
@@ -46,14 +48,14 @@ def run(weights='yolov5s.pt',  # model path
         max_det=1000,  # maximum detections per image
         device='',  # cuda device, i.e. 0 or 0,1,2,3 or cpu
         view_img=False,  # show results
-        save_txt=False,  # save results to *.txt
+        save_txt=True,  # save results to *.txt
         save_conf=False,  # save confidences in --save-txt labels
         save_crop=False,  # save cropped prediction boxes
         nosave=False,  # do not save images/videos
         classes=None,  # filter by class: --class 0, or --class 0 2 3
         agnostic_nms=False,  # class-agnostic NMS
         augment=False,  # augmented inference
-        visualize=False,  # visualize features
+        visualize=True,  # visualize features
         update=False,  # update all models
         project='runs/detect',  # save results to project/name
         name='exp',  # save results to project/name
@@ -107,6 +109,10 @@ def run(weights='yolov5s.pt',  # model path
     predictions_json = None
     csv_file = None  # Add this line to store the file object
     
+    # Initialize ground truth tracking dictionaries
+    ground_truth_buffer = {}
+    position_history = {}
+    
     if save_predictions:
         # Create predictions directory
         predictions_dir = os.path.join(output_base, 'Predictions')
@@ -121,7 +127,8 @@ def run(weights='yolov5s.pt',  # model path
         csv_file = open(predictions_csv, 'w', newline='')  # Store the file object
         csv_writer = csv.writer(csv_file)
         csv_writer.writerow(['frame', 'object_id', 'class', 'current_x', 'current_y', 
-                           'prediction_type', 'probability', 'trajectory'])
+                     'data_type', 'probability', 'trajectory', 
+                     'ground_truth_available', 'ground_truth_trajectory'])
         
         LOGGER.info(f': Predictions will be saved to {predictions_csv} and {predictions_json}')
     
@@ -240,7 +247,7 @@ def run(weights='yolov5s.pt',  # model path
                 s += f'{i}: '
             else:
                 p, im0, frame = path, im0s.copy(), getattr(dataset, 'frame', 0)
-
+                
             p = Path(p)  # to Path
             save_path = str(Path(video_dir) / p.name)  # im.jpg
             txt_path = str(Path(output_base) / 'labels' / p.stem) + ('' if dataset.mode == 'image' else f'_{frame}')
@@ -275,11 +282,65 @@ def run(weights='yolov5s.pt',  # model path
                         # Save to CSV
                         for obj_id, data in prediction_data.items():
                             current_x, current_y = data['current_position']
+                            
+                            # Store current position in history buffer
+                            if obj_id not in position_history:
+                                position_history[obj_id] = []
+                            position_history[obj_id].append((track_predictor.frame_number, current_x, current_y))
+                            
+                            # Check if we can extract ground truth for previous predictions
+                            for frame_num, positions in list(ground_truth_buffer.items()):
+                                # Only process frames that are old enough to have complete ground truth
+                                if track_predictor.frame_number >= frame_num + track_predictor.future_steps:
+                                    for buffer_obj_id, buffer_data in positions.items():
+                                        # Extract actual trajectory from position history
+                                        if buffer_obj_id in position_history:
+                                            # Get positions from the relevant frames
+                                            actual_trajectory = []
+                                            for i in range(1, track_predictor.future_steps + 1):
+                                                target_frame = frame_num + i
+                                                # Find position at this frame
+                                                for hist_frame, hist_x, hist_y in position_history[buffer_obj_id]:
+                                                    if hist_frame == target_frame:
+                                                        actual_trajectory.append((hist_x, hist_y))
+                                                        break
+                                            
+                                            # Update the ground truth buffer with actual trajectory
+                                            if len(actual_trajectory) > 0:
+                                                ground_truth_buffer[frame_num][buffer_obj_id]['ground_truth'] = actual_trajectory
+                                                
+                                            # Write to CSV with ground truth
+                                            for pred_traj, probability in buffer_data['trajectories']:
+                                                trajectory_str = json.dumps(pred_traj)
+                                                ground_truth_str = json.dumps(actual_trajectory)
+                                                csv_writer.writerow([frame_num, buffer_obj_id, buffer_data['class'], 
+                                                           buffer_data['current_x'], buffer_data['current_y'], 
+                                                           'prediction_with_ground_truth', probability, trajectory_str, 
+                                                           True, ground_truth_str])
+                                    
+                                    # Remove processed frame from buffer - FIXED INDENTATION
+                                    del ground_truth_buffer[frame_num]
+                    
+                            # Store current predictions in ground truth buffer for future processing
+                            if track_predictor.frame_number not in ground_truth_buffer:
+                                ground_truth_buffer[track_predictor.frame_number] = {}
+                            
+                            # Add this object to the frame's dictionary (not overwriting the entire dictionary)
+                            ground_truth_buffer[track_predictor.frame_number][obj_id] = {
+                                'class': data['class'],
+                                'current_x': current_x,
+                                'current_y': current_y,
+                                'trajectories': data['trajectories'],
+                                'ground_truth': None  # Will be filled later when we have actual data
+                            }
+                            
+                            # Also write the current prediction to CSV (without ground truth yet)
                             for trajectory, probability in data['trajectories']:
                                 trajectory_str = json.dumps(trajectory)
                                 csv_writer.writerow([track_predictor.frame_number, obj_id, data['class'], 
-                                               current_x, current_y, 'prediction', 
-                                               probability, trajectory_str])
+                                                   current_x, current_y, 'prediction', 
+                                                   probability, trajectory_str, 
+                                                   False, ''])
                 else:
                     # If no tracked detections, process original detections
                     im0 = track_predictor.process_frame(det, im0, names)
@@ -300,6 +361,7 @@ def run(weights='yolov5s.pt',  # model path
 
         # Save results (image with detections)
         if save_img:
+            i = 0  # Initialize i for non-batch processing
             if dataset.mode == 'image':
                 cv2.imwrite(save_path, im0)
             else:  # 'video' or 'stream'
