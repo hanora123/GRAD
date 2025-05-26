@@ -55,6 +55,11 @@ def evaluate_predictions(predictions_csv):
         predicted_trajectory = json.loads(row['trajectory'])
         actual_trajectory = json.loads(row['ground_truth_trajectory'])
         
+        # Skip if either trajectory is empty
+        if len(predicted_trajectory) == 0 or len(actual_trajectory) == 0:
+            print(f"Skipping empty trajectory for class {row['class']}, object ID {row['object_id']} in frame {row['frame']}")
+            continue
+        
         ade = calculate_ade(predicted_trajectory, actual_trajectory)
         fde = calculate_fde(predicted_trajectory, actual_trajectory)
         
