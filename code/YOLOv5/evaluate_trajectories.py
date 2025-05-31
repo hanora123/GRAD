@@ -135,7 +135,7 @@ def main():
         results_df.to_csv(output_dir / 'trajectory_evaluation_results.csv', index=False)
         
         # Create visualizations
-        create_visualizations(results_df, output_dir, unit)
+        # create_visualizations(results_df, output_dir, unit) # Remove this line
     plt.figure(figsize=(12, 8))
     
     # ADE distribution
